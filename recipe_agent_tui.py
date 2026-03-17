@@ -37,6 +37,7 @@ dotenv.load_dotenv()
 DEFAULT_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-haiku-4-5-20251001")
 MAX_TOOL_RESULTS = 8
 BRAINTRUST_PROJECT = os.getenv("BRAINTRUST_PROJECT", "Trader Joes Recipe Agent")
+DEFAULT_SYSTEM_PROMPT_FILE = os.getenv("SYSTEM_PROMPT_FILE", "SYSTEM.md")
 
 
 def normalize_product(item: Dict[str, Any]) -> Dict[str, Any]:
@@ -50,6 +51,41 @@ def normalize_product(item: Dict[str, Any]) -> Dict[str, Any]:
         "availability": item.get("availability", ""),
         "url_key": item.get("url_key", ""),
     }
+
+
+def _read_system_prompt(default_store_code: str) -> str:
+    """
+    Loads the system prompt from SYSTEM_PROMPT_FILE or uses the built-in default.
+    """
+    filenames = [
+        os.getenv("SYSTEM_PROMPT_FILE", "SYSTEM.md"),
+        "SYSTEM.md",
+        "system.md",
+    ]
+    for filename in filenames:
+        try:
+            if filename.startswith("@"):
+                filename = filename.lstrip("@")
+            with open(filename, encoding="utf-8") as f:
+                prompt = f.read().strip()
+                # Optionally substitute store code variable if present in file
+                # prompt = prompt.replace("{STORE_CODE}", default_store_code)
+                print(prompt)
+                return prompt
+        except FileNotFoundError:
+            continue
+    # fallback default if not found
+    return (
+        "You are a pragmatic recipe-planning assistant. "
+        "Use Trader Joe's catalog tools to ground ingredient suggestions in real products when helpful. "
+        f"The default store code is {default_store_code}. "
+        "Do not invent exact SKUs or prices without tool confirmation. "
+        "If the user asks for a recipe, produce a recipe title, a short why-this-works note, "
+        "an ingredient list that references Trader Joe's product matches when available, "
+        "and concise cooking steps. "
+        "If product data is incomplete, say what is confirmed versus inferred. "
+        "Use tools before making product-specific claims."
+    )
 
 
 class TurnLog:
@@ -88,15 +124,15 @@ class ClaudeRecipeAgent:
         self._loop = asyncio.new_event_loop()
         self._shutdown_event: asyncio.Event | None = None
         self._startup_error: Exception | None = None
+
+        self._system_prompt_str = _read_system_prompt(self.store_code)
         self.client = ClaudeSDKClient(
             ClaudeAgentOptions(
                 model=model,
-                system_prompt=self._system_prompt(),
+                system_prompt=self._system_prompt_str,
                 allowed_tools=["search_products", "lookup_skus", "Read", "Glob"],
                 permission_mode="default",
-                mcp_servers={
-                    "traderjoes": self._create_tj_mcp_server()
-                },
+                mcp_servers={"traderjoes": self._create_tj_mcp_server()},
             )
         )
 
@@ -105,7 +141,9 @@ class ClaudeRecipeAgent:
         self._thread.start()
         self._ready.wait(timeout=10)
         if self._startup_error is not None:
-            raise RuntimeError(f"Claude SDK startup failed: {self._startup_error}") from self._startup_error
+            raise RuntimeError(
+                f"Claude SDK startup failed: {self._startup_error}"
+            ) from self._startup_error
         if not self._ready.is_set():
             raise RuntimeError("Claude SDK startup timed out")
 
@@ -189,7 +227,9 @@ class ClaudeRecipeAgent:
             filtered = [str(sku).strip() for sku in raw_skus if str(sku).strip()]
             if not filtered:
                 return {
-                    "content": [{"type": "text", "text": "at least one SKU is required"}],
+                    "content": [
+                        {"type": "text", "text": "at least one SKU is required"}
+                    ],
                     "is_error": True,
                 }
 
@@ -285,13 +325,19 @@ class ClaudeRecipeAgent:
                         self.output_queue.put(("Tool", summary))
             elif isinstance(message, ResultMessage):
                 self.output_queue.put(
-                    ("System", f"Usage: prompt={message.prompt_tokens} output={message.output_tokens}")
+                    (
+                        "System",
+                        f"Usage: prompt={message.prompt_tokens} output={message.output_tokens}",
+                    )
                 )
                 if current:
                     if self.logger:
                         try:
                             self.logger.log(
-                                input={"user": current.user_text, "session": self.session_id},
+                                input={
+                                    "user": current.user_text,
+                                    "session": self.session_id,
+                                },
                                 output={
                                     "assistant": current.assistant_text(),
                                     "tool_events": current.tool_events,
@@ -313,17 +359,8 @@ class ClaudeRecipeAgent:
         self._thread.join(timeout=5)
 
     def _system_prompt(self) -> str:
-        return (
-            "You are a pragmatic recipe-planning assistant. "
-            "Use Trader Joe's catalog tools to ground ingredient suggestions in real products when helpful. "
-            f"The default store code is {self.store_code}. "
-            "Do not invent exact SKUs or prices without tool confirmation. "
-            "If the user asks for a recipe, produce a recipe title, a short why-this-works note, "
-            "an ingredient list that references Trader Joe's product matches when available, "
-            "and concise cooking steps. "
-            "If product data is incomplete, say what is confirmed versus inferred. "
-            "Use tools before making product-specific claims."
-        )
+        # Not used; prompt is set once in __init__. Provided for compatibility if code elsewhere expects it.
+        return self._system_prompt_str
 
 
 class RecipeAgentTUI:
