@@ -1,0 +1,12 @@
+*.db
+*.csv
+*.pyc
+*.hi
+*.o
+*.dyn_o
+*.dyn_hi
+*.log
+__pycache__/
+Main
+site/
+dist-newstyle

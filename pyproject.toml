@@ -1,0 +1,33 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "agent-joes"
+version = "0.1.0"
+description = "Trader Joe's price tracker and recipe agent in Python"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "braintrust>=0.0.40",
+    "claude-agent-sdk>=0.1.48",
+    "python-dotenv>=1.0.1",
+    "requests>=2.31.0",
+    "selenium>=4.15.0",
+    "webdriver-manager>=4.0.1",
+]
+
+[project.scripts]
+traderjoes = "traderjoes:main"
+recipe-agent-tui = "recipe_agent_tui:main"
+
+[tool.uv]
+package = true
+
+[tool.hatch.build.targets.wheel]
+only-include = [
+    "traderjoes.py",
+    "recipe_agent_tui.py",
+    "README.md",
+    "pyproject.toml",
+]

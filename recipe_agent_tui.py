@@ -1,25 +1,40 @@
 #!/usr/bin/env python3
 """
-Minimal Anthropic-powered recipe agent with a curses TUI.
+Recipe agent TUI backed by the Claude Agent SDK.
 """
 
 import argparse
+import asyncio
+import contextlib
 import curses
 import json
 import os
+import queue
 import textwrap
-from typing import Any, Dict, List, Tuple
+import threading
+from typing import Any, Dict, List, Tuple, Deque
+from collections import deque
 
 from traderjoes import TraderJoesAPI
 
-import anthropic
-from braintrust import init_logger, wrap_anthropic
 import dotenv
+from claude_agent_sdk import (
+    AssistantMessage,
+    ClaudeAgentOptions,
+    ClaudeSDKClient,
+    ResultMessage,
+    TextBlock,
+    ToolResultBlock,
+    ToolUseBlock,
+    create_sdk_mcp_server,
+    tool,
+)
+from braintrust import init_logger
 
 
 dotenv.load_dotenv()
 
-DEFAULT_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-haiku-4-5")
+DEFAULT_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-haiku-4-5-20251001")
 MAX_TOOL_RESULTS = 8
 BRAINTRUST_PROJECT = os.getenv("BRAINTRUST_PROJECT", "Trader Joes Recipe Agent")
 
@@ -37,92 +52,270 @@ def normalize_product(item: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-class RecipeAgent:
-    def __init__(self, api_key: str, model: str, store_code: str):
-        if anthropic is None:
-            raise RuntimeError(
-                "Missing dependency: install the 'anthropic' package to run the recipe agent."
-            )
-        if init_logger is None or wrap_anthropic is None:
-            raise RuntimeError(
-                "Missing dependency: install the 'braintrust' package to enable Anthropic tracing."
-            )
+class TurnLog:
+    def __init__(self, user_text: str):
+        self.user_text = user_text
+        self.assistant_chunks: List[str] = []
+        self.tool_events: List[str] = []
 
-        self.api_key = api_key
+    def assistant_text(self) -> str:
+        return "\n\n".join(chunk for chunk in self.assistant_chunks if chunk).strip()
+
+
+class ClaudeRecipeAgent:
+    """
+    Wraps Claude Agent SDK in a background asyncio loop so the curses UI can stay synchronous.
+    """
+
+    def __init__(self, api_key: str, model: str, store_code: str):
+        if not api_key:
+            raise SystemExit("ANTHROPIC_API_KEY is required")
+
         self.model = model
         self.store_code = store_code
         self.catalog_api = TraderJoesAPI(verbose=False)
-        self.messages: List[Dict[str, Any]] = []
+        self.session_id = "default"
+        self.turns: Deque[TurnLog] = deque()
+
         self.logger = None
         if os.getenv("BRAINTRUST_API_KEY"):
-            self.logger = init_logger(project=BRAINTRUST_PROJECT)
-        self.client = wrap_anthropic(anthropic.Anthropic(api_key=api_key))
+            try:
+                self.logger = init_logger(project=BRAINTRUST_PROJECT)
+            except Exception:
+                self.logger = None
+
+        self.output_queue: "queue.Queue[Tuple[str, str]]" = queue.Queue()
+        self._loop = asyncio.new_event_loop()
+        self._shutdown_event: asyncio.Event | None = None
+        self._startup_error: Exception | None = None
+        self.client = ClaudeSDKClient(
+            ClaudeAgentOptions(
+                model=model,
+                system_prompt=self._system_prompt(),
+                allowed_tools=["search_products", "lookup_skus", "Read", "Glob"],
+                permission_mode="default",
+                mcp_servers={
+                    "traderjoes": self._create_tj_mcp_server()
+                },
+            )
+        )
+
+        self._ready = threading.Event()
+        self._thread = threading.Thread(target=self._run_loop, daemon=True)
+        self._thread.start()
+        self._ready.wait(timeout=10)
+        if self._startup_error is not None:
+            raise RuntimeError(f"Claude SDK startup failed: {self._startup_error}") from self._startup_error
+        if not self._ready.is_set():
+            raise RuntimeError("Claude SDK startup timed out")
+
+    def _create_tj_mcp_server(self):
+        api = self.catalog_api
+
+        @tool(
+            "search_products",
+            "Search Trader Joe's products by keyword for a store.",
+            {
+                "type": "object",
+                "properties": {
+                    "search_term": {
+                        "type": "string",
+                        "description": "Ingredient or product phrase to search for.",
+                    },
+                    "store_code": {
+                        "type": "string",
+                        "description": "Store code; omit to use current default.",
+                    },
+                },
+                "required": ["search_term"],
+            },
+        )
+        async def search_products(args: Dict[str, Any]):
+            term = str(args.get("search_term", "")).strip()
+            if not term:
+                return {
+                    "content": [{"type": "text", "text": "search_term is required"}],
+                    "is_error": True,
+                }
+
+            code = str(args.get("store_code") or self.store_code)
+
+            def _call():
+                result = api.search_products(code, term) or {}
+                items = result.get("data", {}).get("products", {}).get("items", [])
+                normalized = [
+                    normalize_product(item) for item in items[:MAX_TOOL_RESULTS]
+                ]
+                return {
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": json.dumps(
+                                {
+                                    "store_code": code,
+                                    "search_term": term,
+                                    "total_results": len(items),
+                                    "items": normalized,
+                                },
+                                ensure_ascii=True,
+                            ),
+                        }
+                    ]
+                }
+
+            return await asyncio.to_thread(_call)
+
+        @tool(
+            "lookup_skus",
+            "Look up specific Trader Joe's SKUs for the current or provided store.",
+            {
+                "type": "object",
+                "properties": {
+                    "skus": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "One or more SKU identifiers.",
+                    },
+                    "store_code": {
+                        "type": "string",
+                        "description": "Store code; omit to use current default.",
+                    },
+                },
+                "required": ["skus"],
+            },
+        )
+        async def lookup_skus(args: Dict[str, Any]):
+            raw_skus = args.get("skus", [])
+            filtered = [str(sku).strip() for sku in raw_skus if str(sku).strip()]
+            if not filtered:
+                return {
+                    "content": [{"type": "text", "text": "at least one SKU is required"}],
+                    "is_error": True,
+                }
+
+            code = str(args.get("store_code") or self.store_code)
+
+            def _call():
+                result = api.get_products_by_skus(code, filtered) or {}
+                items = result.get("data", {}).get("products", {}).get("items", [])
+                normalized = [
+                    normalize_product(item) for item in items[:MAX_TOOL_RESULTS]
+                ]
+                return {
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": json.dumps(
+                                {
+                                    "store_code": code,
+                                    "skus": filtered,
+                                    "total_results": len(items),
+                                    "items": normalized,
+                                },
+                                ensure_ascii=True,
+                            ),
+                        }
+                    ]
+                }
+
+            return await asyncio.to_thread(_call)
+
+        return create_sdk_mcp_server(
+            name="traderjoes", version="1.0.0", tools=[search_products, lookup_skus]
+        )
+
+    def _run_loop(self):
+        asyncio.set_event_loop(self._loop)
+        try:
+            self._loop.run_until_complete(self._main())
+        except Exception as exc:
+            self._startup_error = exc
+            self._ready.set()
+
+    async def _main(self):
+        self._shutdown_event = asyncio.Event()
+        await self.client.connect()
+        self._ready.set()
+        receiver = asyncio.create_task(self._pump_messages())
+        await self._shutdown_event.wait()
+        receiver.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await receiver
+        await self.client.disconnect()
 
     def reset(self):
-        self.messages = []
+        self.session_id = os.urandom(4).hex()
+        self.turns.clear()
 
     def set_store_code(self, store_code: str):
         self.store_code = store_code
 
-    def run_turn(self, user_text: str) -> Tuple[str, List[str]]:
-        self.messages.append({"role": "user", "content": user_text})
-        tool_events: List[str] = []
-
-        while True:
-            response = self._call_anthropic()
-            content = response.get("content", [])
-            self.messages.append({"role": "assistant", "content": content})
-
-            tool_uses = [block for block in content if block.get("type") == "tool_use"]
-            if tool_uses:
-                tool_results = []
-                for tool_use in tool_uses:
-                    result, summary = self._execute_tool(
-                        tool_use["name"], tool_use.get("input", {})
-                    )
-                    tool_events.append(summary)
-                    tool_results.append(
-                        {
-                            "type": "tool_result",
-                            "tool_use_id": tool_use["id"],
-                            "content": json.dumps(result, ensure_ascii=True),
-                        }
-                    )
-
-                self.messages.append({"role": "user", "content": tool_results})
-                continue
-
-            text_blocks = [
-                block.get("text", "").strip()
-                for block in content
-                if block.get("type") == "text" and block.get("text", "").strip()
-            ]
-            final_text = "\n\n".join(text_blocks).strip()
-            return final_text or "No response returned.", tool_events
-
-    def _call_anthropic(self) -> Dict[str, Any]:
+    def send_user_message(self, text: str):
+        turn = TurnLog(text)
+        self.turns.append(turn)
+        future = asyncio.run_coroutine_threadsafe(
+            self.client.query(prompt=text, session_id=self.session_id),
+            self._loop,
+        )
         try:
-            response = self.client.messages.create(
-                model=self.model,
-                max_tokens=1400,
-                system=self._system_prompt(),
-                messages=self.messages,
-                tools=self._tool_definitions(),
-            )
+            future.result(timeout=1)
         except Exception as exc:
-            raise RuntimeError(f"Anthropic API request failed: {exc}") from exc
+            self.output_queue.put(("Error", f"Failed to send: {exc}"))
 
-        return {
-            "content": [serialize_block(block) for block in response.content],
-            "id": getattr(response, "id", None),
-            "model": getattr(response, "model", None),
-            "stop_reason": getattr(response, "stop_reason", None),
-        }
+    async def _pump_messages(self):
+        async for message in self.client.receive_messages():
+            current = self.turns[0] if self.turns else None
+            if isinstance(message, AssistantMessage):
+                for block in message.content:
+                    if isinstance(block, TextBlock):
+                        text = block.text.strip()
+                        if text:
+                            if current:
+                                current.assistant_chunks.append(text)
+                            self.output_queue.put(("Chef", text))
+                    elif isinstance(block, ToolUseBlock):
+                        summary = f"tool {block.name} -> {json.dumps(block.input)}"
+                        if current:
+                            current.tool_events.append(summary)
+                        self.output_queue.put(("Tool", summary))
+                    elif isinstance(block, ToolResultBlock):
+                        summary = f"tool result {block.tool_use_id}: {block.content}"
+                        if current:
+                            current.tool_events.append(summary)
+                        self.output_queue.put(("Tool", summary))
+            elif isinstance(message, ResultMessage):
+                self.output_queue.put(
+                    ("System", f"Usage: prompt={message.prompt_tokens} output={message.output_tokens}")
+                )
+                if current:
+                    if self.logger:
+                        try:
+                            self.logger.log(
+                                input={"user": current.user_text, "session": self.session_id},
+                                output={
+                                    "assistant": current.assistant_text(),
+                                    "tool_events": current.tool_events,
+                                    "usage": {
+                                        "prompt_tokens": message.prompt_tokens,
+                                        "output_tokens": message.output_tokens,
+                                    },
+                                },
+                            )
+                        except Exception:
+                            pass
+                    self.turns.popleft()
+            else:
+                self.output_queue.put(("System", repr(message)))
+
+    def close(self):
+        if self._shutdown_event:
+            self._loop.call_soon_threadsafe(self._shutdown_event.set)
+        self._thread.join(timeout=5)
 
     def _system_prompt(self) -> str:
         return (
             "You are a pragmatic recipe-planning assistant. "
-            "Use Trader Joe's catalog tools to ground ingredient suggestions in real products when that would help. "
+            "Use Trader Joe's catalog tools to ground ingredient suggestions in real products when helpful. "
             f"The default store code is {self.store_code}. "
             "Do not invent exact SKUs or prices without tool confirmation. "
             "If the user asks for a recipe, produce a recipe title, a short why-this-works note, "
@@ -132,104 +325,9 @@ class RecipeAgent:
             "Use tools before making product-specific claims."
         )
 
-    def _tool_definitions(self) -> List[Dict[str, Any]]:
-        return [
-            {
-                "name": "search_products",
-                "description": "Search Trader Joe's products by keyword for a store.",
-                "input_schema": {
-                    "type": "object",
-                    "properties": {
-                        "search_term": {
-                            "type": "string",
-                            "description": "Ingredient or product phrase to search for.",
-                        },
-                        "store_code": {
-                            "type": "string",
-                            "description": "Trader Joe's store code. Omit to use the current default store.",
-                        },
-                    },
-                    "required": ["search_term"],
-                },
-            },
-            {
-                "name": "lookup_skus",
-                "description": "Look up specific Trader Joe's SKUs for the current or provided store.",
-                "input_schema": {
-                    "type": "object",
-                    "properties": {
-                        "skus": {
-                            "type": "array",
-                            "items": {"type": "string"},
-                            "description": "One or more SKU identifiers.",
-                        },
-                        "store_code": {
-                            "type": "string",
-                            "description": "Trader Joe's store code. Omit to use the current default store.",
-                        },
-                    },
-                    "required": ["skus"],
-                },
-            },
-        ]
-
-    def _execute_tool(
-        self, name: str, payload: Dict[str, Any]
-    ) -> Tuple[Dict[str, Any], str]:
-        if name == "search_products":
-            search_term = str(payload.get("search_term", "")).strip()
-            if not search_term:
-                return {
-                    "error": "search_term is required"
-                }, "search_products failed: missing search term"
-
-            store_code = str(payload.get("store_code") or self.store_code)
-            result = self.catalog_api.search_products(store_code, search_term) or {}
-            items = result.get("data", {}).get("products", {}).get("items", [])
-            normalized = [normalize_product(item) for item in items[:MAX_TOOL_RESULTS]]
-            summary = f"search_products('{search_term}', store={store_code}) -> {len(items)} result(s)"
-            return {
-                "store_code": store_code,
-                "search_term": search_term,
-                "total_results": len(items),
-                "items": normalized,
-            }, summary
-
-        if name == "lookup_skus":
-            raw_skus = payload.get("skus", [])
-            skus = [str(sku).strip() for sku in raw_skus if str(sku).strip()]
-            if not skus:
-                return {
-                    "error": "at least one SKU is required"
-                }, "lookup_skus failed: missing SKUs"
-
-            store_code = str(payload.get("store_code") or self.store_code)
-            result = self.catalog_api.get_products_by_skus(store_code, skus) or {}
-            items = result.get("data", {}).get("products", {}).get("items", [])
-            normalized = [normalize_product(item) for item in items[:MAX_TOOL_RESULTS]]
-            summary = f"lookup_skus({', '.join(skus)}, store={store_code}) -> {len(items)} result(s)"
-            return {
-                "store_code": store_code,
-                "skus": skus,
-                "total_results": len(items),
-                "items": normalized,
-            }, summary
-
-        return {"error": f"unknown tool '{name}'"}, f"{name} failed: unknown tool"
-
-
-def serialize_block(block: Any) -> Dict[str, Any]:
-    if isinstance(block, dict):
-        return block
-    if hasattr(block, "model_dump"):
-        return block.model_dump(mode="json", exclude_none=True)
-    if hasattr(block, "__dict__"):
-        return {key: value for key, value in vars(block).items() if value is not None}
-    raise TypeError(f"Unsupported Anthropic content block: {type(block)!r}")
-
 
 class RecipeAgentTUI:
-    def __init__(self, agent: RecipeAgent):
+    def __init__(self, agent: ClaudeRecipeAgent):
         self.agent = agent
         self.entries: List[Tuple[str, str]] = [
             (
@@ -239,21 +337,27 @@ class RecipeAgentTUI:
         ]
         self.input_buffer = ""
         self.status = self._status_text()
+        self.running = True
 
     def run(self, stdscr):
-        curses.curs_set(1)
+        with contextlib.suppress(curses.error):
+            curses.curs_set(1)
         stdscr.keypad(True)
+        stdscr.timeout(200)  # allow periodic screen refresh to surface agent output
 
-        while True:
+        while self.running:
+            self._drain_events()
             self._render(stdscr)
-            key = stdscr.get_wch()
+            try:
+                key = stdscr.get_wch()
+            except curses.error:
+                continue
 
             if key == curses.KEY_RESIZE:
                 continue
 
             if key in ("\n", "\r"):
-                if not self._submit(stdscr):
-                    return
+                self._submit()
                 continue
 
             if key in (curses.KEY_BACKSPACE, "\b", "\x7f"):
@@ -263,38 +367,28 @@ class RecipeAgentTUI:
             if isinstance(key, str) and key.isprintable():
                 self.input_buffer += key
 
-    def _submit(self, stdscr) -> bool:
+    def _submit(self):
         text = self.input_buffer.strip()
         self.input_buffer = ""
         if not text:
-            return True
+            return
 
         if text.startswith("/"):
-            return self._handle_command(text)
+            self._handle_command(text)
+            return
 
         self.entries.append(("You", text))
-        self.status = "Waiting on Anthropic..."
-        self._render(stdscr)
+        self.status = "Waiting on Claude..."
+        self.agent.send_user_message(text)
 
-        try:
-            reply, tool_events = self.agent.run_turn(text)
-            for event in tool_events:
-                self.entries.append(("Tool", event))
-            self.entries.append(("Chef", reply))
-            self.status = self._status_text()
-        except Exception as exc:
-            self.entries.append(("Error", str(exc)))
-            self.status = self._status_text()
-
-        return True
-
-    def _handle_command(self, text: str) -> bool:
+    def _handle_command(self, text: str):
         command, _, argument = text.partition(" ")
         command = command.lower()
         argument = argument.strip()
 
         if command in {"/quit", "/exit"}:
-            return False
+            self.running = False
+            return
 
         if command in {"/clear", "/reset"}:
             self.agent.reset()
@@ -305,16 +399,16 @@ class RecipeAgentTUI:
                 )
             ]
             self.status = self._status_text()
-            return True
+            return
 
         if command == "/store":
             if not argument:
                 self.entries.append(("System", "Usage: /store <code>"))
-                return True
+                return
             self.agent.set_store_code(argument)
             self.entries.append(("System", f"Default store changed to {argument}."))
             self.status = self._status_text()
-            return True
+            return
 
         if command == "/help":
             self.entries.append(
@@ -324,10 +418,18 @@ class RecipeAgentTUI:
                     "Use /store <code> to change stores, /clear to reset the chat, and /quit to exit.",
                 )
             )
-            return True
+            return
 
         self.entries.append(("System", f"Unknown command: {command}"))
-        return True
+
+    def _drain_events(self):
+        while True:
+            try:
+                role, text = self.agent.output_queue.get_nowait()
+                self.entries.append((role, text))
+                self.status = self._status_text()
+            except queue.Empty:
+                break
 
     def _status_text(self) -> str:
         return f"store={self.agent.store_code}  model={self.agent.model}"
@@ -376,24 +478,23 @@ class RecipeAgentTUI:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Anthropic recipe agent for Trader Joe's"
+        description="Claude Agent SDK recipe assistant for Trader Joe's"
     )
     parser.add_argument(
         "--store", default="226", help="Trader Joe's store code (default: 226)"
     )
-    parser.add_argument("--model", default=DEFAULT_MODEL, help="Anthropic model name")
+    parser.add_argument("--model", default=DEFAULT_MODEL, help="Claude model name")
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
     api_key = os.getenv("ANTHROPIC_API_KEY")
-    if not api_key:
-        raise SystemExit("ANTHROPIC_API_KEY is required")
-
-    agent = RecipeAgent(api_key=api_key, model=args.model, store_code=args.store)
-    tui = RecipeAgentTUI(agent)
-    curses.wrapper(tui.run)
+    agent = ClaudeRecipeAgent(api_key=api_key, model=args.model, store_code=args.store)
+    try:
+        curses.wrapper(RecipeAgentTUI(agent).run)
+    finally:
+        agent.close()
 
 
 if __name__ == "__main__":
