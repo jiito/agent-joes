@@ -10,3 +10,5 @@ __pycache__/
 Main
 site/
 dist-newstyle
+
+.vercel

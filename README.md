@@ -71,6 +71,60 @@ Optional flags:
 uv run recipe-agent-tui --store 226 --model claude-haiku-4-5-20251001
 ```
 
+### Twilio SMS Webhook
+
+This repo now also exposes a simple Twilio SMS webhook for the Trader Joe's
+recipe agent.
+
+Install deps:
+
+```bash
+uv sync
+```
+
+Required env vars:
+
+```bash
+export ANTHROPIC_API_KEY="your_api_key"
+export TWILIO_AUTH_TOKEN="your_twilio_auth_token"
+```
+
+Optional env vars:
+
+```bash
+export ANTHROPIC_MODEL="claude-haiku-4-5-20251001"
+export DEFAULT_STORE_CODE="226"
+export TWILIO_WEBHOOK_URL="https://your-deployment.vercel.app/api/twilio/sms"
+```
+
+Run locally:
+
+```bash
+uv run uvicorn app:app --reload
+```
+
+Webhook endpoint:
+
+```text
+POST /api/twilio/sms
+```
+
+The endpoint expects Twilio's standard inbound SMS webhook form payload,
+validates `X-Twilio-Signature`, runs a single request-scoped recipe agent turn,
+and replies with TwiML.
+
+Deploy a preview to Vercel:
+
+```bash
+vercel deploy -y
+```
+
+After deploy, set the Twilio phone number's incoming message webhook to:
+
+```text
+https://<your-vercel-url>/api/twilio/sms
+```
+
 TUI commands:
 
 - `/help` shows usage
