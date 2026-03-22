@@ -7,7 +7,10 @@ app.innerHTML = `
     <div class="mx-auto flex min-h-screen max-w-6xl flex-col px-6 py-6 sm:px-8 lg:px-10">
       <header class="flex items-center justify-between py-2">
         <a href="/" class="text-base font-semibold tracking-[-0.03em]">Agent Joes</a>
-        <a href="#details" class="text-sm text-neutral-500 transition hover:text-neutral-900">About</a>
+        <nav class="flex items-center gap-5 text-sm text-neutral-500">
+          <a href="/chat.html" class="transition hover:text-neutral-900">Test chat</a>
+          <a href="#details" class="transition hover:text-neutral-900">About</a>
+        </nav>
       </header>
 
       <main class="flex flex-1 flex-col items-center justify-center text-center">
@@ -22,10 +25,10 @@ app.innerHTML = `
 
           <div class="mt-10 flex flex-col items-center justify-center gap-3 sm:flex-row">
             <a
-              href="#details"
+              href="/chat.html"
               class="inline-flex min-h-[48px] items-center justify-center rounded-full bg-neutral-950 px-6 text-sm font-medium text-white transition hover:bg-neutral-800"
             >
-              Learn more
+              Try the chat
             </a>
             <a
               href="#details"
@@ -36,7 +39,7 @@ app.innerHTML = `
           </div>
 
           <p class="mt-4 text-xs text-neutral-400">
-            Currently available through a Python app, terminal UI, and SMS webhook.
+            Browser chat now mirrors the SMS-style agent flow before you switch to the real text interface.
           </p>
         </div>
       </main>
