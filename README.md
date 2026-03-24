@@ -19,6 +19,26 @@ uv sync
 
 This installs everything (CLI, Selenium webdriver fallback, Anthropic + Braintrust recipe agent, dotenv). Selenium enables automatic cookie retrieval — no manual cookie updates needed.
 
+## Website
+
+A small Vite site now lives in `web/` to explain the current application and its
+main surfaces.
+
+Install and run it with:
+
+```bash
+cd web
+npm install
+npm run dev
+```
+
+Build a production bundle with:
+
+```bash
+cd web
+npm run build
+```
+
 ## Usage
 
 ### Search for Products

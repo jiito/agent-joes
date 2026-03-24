@@ -28,10 +28,14 @@ recipe-agent-tui = "recipe_agent_tui:main"
 [tool.uv]
 package = true
 
+[tool.vercel.scripts]
+build = "python build_vercel.py"
+
 [tool.hatch.build.targets.wheel]
 only-include = [
     "agent_service.py",
     "app.py",
+    "build_vercel.py",
     "traderjoes.py",
     "recipe_agent_tui.py",
     "README.md",
