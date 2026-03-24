@@ -1,0 +1,10 @@
+anthropic>=0.84.0
+braintrust>=0.0.40
+claude-agent-sdk>=0.1.48
+fastapi>=0.117.1
+python-dotenv>=1.0.1
+requests>=2.31.0
+selenium>=4.15.0
+twilio>=9.8.3
+uvicorn>=0.36.0
+webdriver-manager>=4.0.1
